@@ -1,32 +1,30 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21 (FINAL)
+ * CAPUNGA DADOS — BAC BO · v20
  *
- * Objetivo desta versão: o bot NUNCA fica mais de ~4 min sem sinal (com a API saudável).
- *
- * Por que a v20 não gerava sinais:
- *  - Os filtros (p1 >= média geral - 1%, n >= 10, liveMin 86%, regime) eliminavam quase tudo,
- *    e o "tier relaxado" ainda era rígido demais. Sem tier final, o bot ficava calado para sempre.
- *  - Pausa de 15 min após 2 LOSS e stop do dia baixo travavam a frequência.
- *
- * Como a v21 resolve (escada de relaxamento por tempo sem sinal):
- *   tier 0 (0s)     : rigoroso   — só estratégias acima da média histórica
- *   tier 1 (>=75s)  : moderado   — abaixo da média tolerado, regime ainda filtra
- *   tier 2 (>=150s) : amplo      — qualquer estratégia com amostra mínima, sem filtro de regime
- *   tier 3 (>=200s) : GARANTIA   — escolhe a melhor estratégia disparada (mesmo suspensa/pequena
- *                                  amostra); se nenhuma disparar, usa "Fluxo da mesa".
- *   => com a API ativa o intervalo máximo entre sinais fica ≈ 3m20s–4m (limite: CFG.maxIdleMs).
- *
- * Mantidos: bloqueio de estratégias ruins (blockKeys) em tiers 0–2, suspensão por LOSS,
- * API parada = sem sinal, janela de leitura igual ao backtest, probabilidades honestas,
- * advisory lock, placar diário (00h00 Angola).
- *
- * Importante: Bac Bo é aleatório. Frequência forçada reduz a seletividade — a taxa de loss
- * tende a subir nos tiers 2–3. Meça pelo /calibracao e pelo campo tier de cada sinal.
+ * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
+ *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
+ *     (2.5 min), NÃO se gera sinal. A v19 gerava sinais com a API parada há
+ *     horas — origem das "oportunidades forçadas" com ~33% de perdas.
+ *  2. SEQUÊNCIA DE RETOMA: após dados parados, exige recoveryRounds rodadas
+ *     NOVAS antes de voltar a emitir sinais (recuperação confirmada, não
+ *     apenas "apareceu uma mensagem nova").
+ *  3. EXPIRADO ≠ LOSS: se as rodadas necessárias para julgar o sinal não
+ *     chegarem (gap > gapMs), o sinal fecha como EXPIRADO (sem apuração),
+ *     separado do placar e da taxa. A v19 publicava LOSS por falha de dados.
+ *  4. CONFIANÇA HONESTA: sem piso fabricado de 80%. A confiança é a taxa
+ *     histórica (backtest + sinais reais) de NÃO PERDER até G2 (green, gale
+ *     ou empate/devolução), com prior neutro. Empate = não perder, não vitória.
+ *  5. TIER 2 SÓ COM DADOS FRESCOS: a escada de relaxamento continua a existir,
+ *     mas nunca opera com dados parados.
+ *  6. v20.1: histórico do bot antigo IGNORADO — tabela e chaves próprias
+ *     (capunga_signals_v20, daily_v20, nextId_v20...). Numeração reinicia
+ *     em #1, placar começa a zero. Rodadas da mesa continuam a ser carregadas
+ *     (são os dados do jogo para as estratégias).
  *
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT,
- *      API_BACBO (opcional), API_BACBO_2 (opcional), ALERT_CHAT_ID (opcional)
+ *      API_BACBO (opcional), API_BACBO_2 (opcional)
  */
 
 const fs = require('fs');
@@ -39,50 +37,42 @@ const { Pool } = require('pg');
 const PORT = Number(process.env.PORT || 10000);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
-const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || CHAT_ID;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const VERSAO = '21.0';
 
 const CFG = {
   ativos: true,
   maxGale: 2,
   maxPending: 1,
-  minAmostra: 40,
-  syncMs: 3000,
-  syncFastMs: 1000,
-  minGapMs: 15000,               // mínimo entre sinais
-  maxIdleMs: 4 * 60 * 1000,      // meta: nunca passar disto sem sinal (tier 3 entra antes)
-  minSettledAgeMs: 4000,
-  freshMaxMs: 2 * 60 * 1000,
-  windowGapMs: 4 * 60 * 1000,
-  warmupRounds: 5,
-  postGapSkip: 0,                // não pula sinal após API voltar (frequência); aquece rodadas apenas
+  minAmostra: 60,
+  syncMs: 3000,               // polling normal
+  syncFastMs: 1000,           // polling com sinal pendente / mesa quente
+  minGapMs: 20000,            // entre sinais (quando há oportunidade)
+  relaxMs: 3 * 60 * 1000,     // 3min sem sinal -> relaxa os filtros
+  forceSignalMs: 5 * 60 * 1000, // 5min -> melhor oportunidade disponível (SÓ com dados frescos)
+  minSettledAgeMs: 5000,
   apuraMaxMs: 600000,
   maxHist: 4000,
-  gapMs: 7 * 60 * 1000,
+  gapMs: 7 * 60 * 1000,       // gap entre rodadas acima disto = dados interrompidos
   maxSignalsMem: 500,
   signalsOnBoot: 500,
-  suspendMs: 90 * 60 * 1000,     // 1h30 (antes 4h: tirava estratégias demais)
+  suspendMs: 4 * 3600 * 1000,
   suspendLossStreak: 3,
-  suspendWindow: 12,
-  suspendWindowLosses: 4,
   staleAlertMs: 3 * 60 * 1000,
   alertThrottleMs: 10 * 60 * 1000,
   keepAliveMs: 60000,
-  priorK: 10,
-  blockKeys: ['SEQ_3_1'],        // 26% de loss na amostra real (bloqueada nos tiers 0–2)
-  lossPauseAfter: 3,             // 3 LOSS seguidos -> pausa curta
-  lossPauseMs: 3 * 60 * 1000,    // 3 min (cabe dentro da meta de 4 min)
-  maxLossDia: 10,                // stop de loss do dia (zera às 00h00 de Angola)
-  tgFailCooldownMs: 8000,        // evita spam de "analisando" se o Telegram falhar
-  motivoLogMs: 60000,
-  // Escada de relaxamento. dP1 relativo à média geral até G1.
+  // ---- NOVO v20 ----
+  maxStaleMs: 150000,         // última rodada mais velha que 2.5min -> sem sinais
+  recoveryRounds: 4,          // rodadas novas exigidas após dados parados
+  confMin: 50,                // piso honesto (v19 fabricava mínimo de 80)
+  confMax: 95,
+  baseRateMin: 0.60,          // limites do base rate do backtest (sem clamp de 0.90)
+  baseRateMax: 0.95,
+  // Escada de rigor por tier (0=rigoroso, 1=relaxado, 2=melhor disponível)
   tiers: [
-    { after: 0,      minN: 10, dP1: -0.01, liveMin: 0.86, regime: true,  useBlock: true,  useSusp: true  },
-    { after: 75000,  minN: 6,  dP1: -0.04, liveMin: 0.80, regime: true,  useBlock: true,  useSusp: true  },
-    { after: 150000, minN: 3,  dP1: -0.08, liveMin: 0.70, regime: false, useBlock: true,  useSusp: true  },
-    { after: 200000, minN: 0,  dP1: -1,    liveMin: 0,    regime: false, useBlock: false, useSusp: false }
+    { scoreMin: 84, minStratN: 8, liveMin: 0.80 },
+    { scoreMin: 80, minStratN: 5, liveMin: 0.72 },
+    { scoreMin: 76, minStratN: 3, liveMin: 0 }
   ]
 };
 
@@ -91,8 +81,7 @@ const B = 'Banca';
 const E = 'Empate';
 const isCol = (x) => x === J || x === B;
 const opp = (c) => (c === J ? B : c === B ? J : null);
-const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
-const ATE_G1 = new Set(['GREEN', 'EMPATE', 'G1', 'EG1']);
+const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS', 'EXPIRADO']);
 const LOCK_KEY = 727272;
 
 const API_SOURCES = [
@@ -110,22 +99,22 @@ const DEPLOY_ID = (() => {
 const S = {
   hist: [], seen: new Set(), signals: [],
   nextId: 1, lastSignalAt: 0, curStreak: 0,
-  stats: null, novosDesdeStats: 0,
-  apiWasDown: false, skipNext: 0, skipRoundId: null,
-  lossRun: 0, pauseUntil: 0, tgFailUntil: 0
+  stats: null, statsAtLen: -1,
+  awaitingRecovery: 0   // rodadas novas ainda necessárias após dados parados
 };
 
-const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, bestStreak: 0 };
-const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
+// Placar DIÁRIO (zera 00h00 Angola = UTC+1)
+const DAILY = { date: '', total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, expirado: 0, bestStreak: 0 };
+// Placar GERAL (persistente)
+const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0, expirado: 0 };
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: VERSAO,
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '20.1',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
-  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false,
-  motivos: {}, ultimoLogMotivo: 0, ultimoCandidatos: 0
+  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false, dadosStale: false
 };
 
 let pool = null, server = null, tickTimer = null, keepTimer = null;
@@ -133,21 +122,20 @@ let busy = false, stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
-const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-
-// Registra o motivo de NÃO ter gerado sinal (e conta por tipo, para diagnóstico em /status)
-function motivo(m) {
-  R.ultimoMotivo = m;
-  const k = String(m).replace(/\d+/g, '#');
-  R.motivos[k] = (R.motivos[k] || 0) + 1;
-}
 
 const fmtHora = new Intl.DateTimeFormat('pt-PT', {
   timeZone: 'Africa/Luanda', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
 });
 const hora = (ms = Date.now()) => fmtHora.format(new Date(ms));
+// Meia-noite em Angola (UTC+1, sem horário de verão)
 const luandaDayKey = (ms = Date.now()) => new Date(ms + 3600000).toISOString().slice(0, 10);
+
 const nomeCor = (c) => (c === B ? 'VERMELHO 🔴' : c === J ? 'AZUL 🔵' : 'EMPATE 🟡');
+const emojiCor = (c) => (c === B ? '🔴' : c === J ? '🔵' : '🟡');
+const barra = (p) => {
+  const f = Math.max(0, Math.min(10, Math.round((p / 100) * 10)));
+  return '▰'.repeat(f) + '▱'.repeat(10 - f);
+};
 
 /* ============================ DB ============================ */
 
@@ -165,13 +153,13 @@ async function dbInit() {
       CREATE TABLE IF NOT EXISTS capunga_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW());
       CREATE TABLE IF NOT EXISTS capunga_rounds (id TEXT PRIMARY KEY, resultado TEXT NOT NULL, t BIGINT NOT NULL, pj DOUBLE PRECISION, pb DOUBLE PRECISION);
       CREATE INDEX IF NOT EXISTS idx_cap_rounds_t ON capunga_rounds(t DESC);
-      CREATE TABLE IF NOT EXISTS capunga_signals (
+      CREATE TABLE IF NOT EXISTS capunga_signals_v20 (
         id INTEGER PRIMARY KEY, cor TEXT NOT NULL, key TEXT NOT NULL, nome TEXT NOT NULL,
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
         gale INT, agree INT, tier INT DEFAULT 0, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
       );
-      CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals(status);
-      CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals_v20(status);
+      CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals_v20(created_at DESC);
     `);
     R.erroDB = null; log('DB', 'schema ok');
   } catch (e) { R.erroDB = e.message; log('DB ERRO', e.message); pool = null; }
@@ -204,23 +192,26 @@ async function dbStateSet(k, v) {
   try {
     await pool.query(
       `INSERT INTO capunga_state(k,v,updated_at) VALUES ($1,$2,NOW())
-       ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`, [k, String(v)]);
+       ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`,
+      [k, String(v)]
+    );
   } catch (e) { R.erroDB = e.message; }
 }
 async function dbSignalInsert(s) {
   if (!pool) return;
   try {
     await pool.query(
-      `INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,tier,created_at,closed_at)
+      `INSERT INTO capunga_signals_v20 (id,cor,key,nome,tipo,conf,status,gale,agree,tier,created_at,closed_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
       [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0,
-        new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]);
+       new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]
+    );
   } catch (e) { R.erroDB = e.message; }
 }
 async function dbSignalUpdate(s) {
   if (!pool) return;
   try {
-    await pool.query('UPDATE capunga_signals SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
+    await pool.query('UPDATE capunga_signals_v20 SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
       [s.status, s.gale ?? null, s.fechadoEm ? new Date(s.fechadoEm) : null, s.id]);
   } catch (e) { R.erroDB = e.message; }
 }
@@ -230,16 +221,19 @@ async function dbRoundUpsert(r) {
     await pool.query(
       `INSERT INTO capunga_rounds(id,resultado,t,pj,pb) VALUES($1,$2,$3,$4,$5)
        ON CONFLICT(id) DO UPDATE SET resultado=EXCLUDED.resultado,t=EXCLUDED.t,pj=EXCLUDED.pj,pb=EXCLUDED.pb`,
-      [r.id, r.resultado, r.t, r.pj, r.pb]);
+      [r.id, r.resultado, r.t, r.pj, r.pb]
+    );
   } catch (e) { R.erroDB = e.message; }
 }
 
 async function dbLoadAlltime() {
   if (!pool) return;
   try {
+    // v20.1: placar geral só a partir dos sinais do v20 (histórico do bot antigo ignorado)
     const r = await pool.query(
-      `SELECT status, COUNT(*)::int AS n FROM capunga_signals
-       WHERE status <> 'PENDENTE' GROUP BY status`);
+      `SELECT status, COUNT(*)::int AS n FROM capunga_signals_v20
+       WHERE status <> 'PENDENTE' AND status <> 'EXPIRADO' GROUP BY status`
+    );
     for (const k of Object.keys(ALLTIME)) ALLTIME[k] = 0;
     for (const row of r.rows) {
       ALLTIME.total += row.n;
@@ -257,38 +251,40 @@ async function dbLoadAlltime() {
 async function dbLoadState() {
   if (!pool) return;
   try {
-    const nextId = await dbStateGet('nextId');
-    const lastSignalAt = await dbStateGet('lastSignalAt');
-    const curStreak = await dbStateGet('curStreak');
-    const pauseUntil = await dbStateGet('pauseUntil');
+    // v20.1: chaves próprias — o histórico/estado do bot antigo (v19) NÃO é carregado.
+    // O bot começa com numeração #1, placar zero e suspensões limpas.
+    const nextId = await dbStateGet('nextId_v20');
+    const lastSignalAt = await dbStateGet('lastSignalAt_v20');
+    const curStreak = await dbStateGet('curStreak_v20');
     if (nextId) S.nextId = Math.max(1, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
     if (curStreak) S.curStreak = parseInt(curStreak, 10);
-    // pausa antiga (v20 = 15 min) nunca pode ultrapassar a nova duração
-    if (pauseUntil) S.pauseUntil = Math.min(parseInt(pauseUntil, 10) || 0, Date.now() + CFG.lossPauseMs);
 
     try {
-      const mx = await pool.query('SELECT COALESCE(MAX(id),0)::int AS m FROM capunga_signals');
-      const m = mx.rows[0]?.m || 0;
-      if (S.nextId <= m) { S.nextId = m + 1; await dbStateSet('nextId', String(S.nextId)); }
+      const raw = await dbStateGet('suspended_v20');
+      if (raw) {
+        const arr = JSON.parse(raw);
+        const now = Date.now();
+        for (const [key, until] of arr) if (until > now) SUSPENDED[key] = until;
+      }
     } catch (_) {}
 
-    // v21: começa sem suspensões herdadas (as regras de suspensão mudaram)
-    await dbStateSet('suspended', '[]');
-
+    // Placar diário persistido (apenas v20)
     try {
-      const rawD = await dbStateGet('daily_v19');
-      if (rawD) Object.assign(DAILY, JSON.parse(rawD));
+      const rawD = await dbStateGet('daily_v20');
+      if (rawD) {
+        const d = JSON.parse(rawD);
+        for (const k of Object.keys(DAILY)) if (k in d) DAILY[k] = d[k];
+      }
     } catch (_) {}
     if (!DAILY.date) DAILY.date = luandaDayKey();
 
+    // rodadas da MESA (dados do jogo, precisam-se para as estratégias — não é histórico do bot)
     const rounds = await pool.query(`SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC LIMIT ${CFG.maxHist}`);
-    S.hist = rounds.rows.map((r) => ({
-      id: r.id, resultado: r.resultado, t: Number(r.t),
-      pj: r.pj === null ? null : Number(r.pj), pb: r.pb === null ? null : Number(r.pb)
-    })).reverse();
+    S.hist = rounds.rows.map((r) => ({ id: r.id, resultado: r.resultado, t: Number(r.t), pj: r.pj === null ? null : Number(r.pj), pb: r.pb === null ? null : Number(r.pb) })).reverse();
     S.seen = new Set(S.hist.map((r) => r.id));
-    const r = await pool.query(`SELECT * FROM capunga_signals ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
+    // sinais: SOMENTE os do v20
+    const r = await pool.query(`SELECT * FROM capunga_signals_v20 ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
     S.signals = r.rows.reverse().map((row) => ({
       id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree, tier: row.tier || 0,
@@ -298,17 +294,18 @@ async function dbLoadState() {
     }));
     await dbLoadAlltime();
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, diário=${DAILY.date}`);
+
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
 }
 
 /* ============================ TELEGRAM ============================ */
 
-async function tgSendRaw(texto, chatId = CHAT_ID) {
-  if (!BOT_TOKEN || !chatId) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
+async function tgSendRaw(texto) {
+  if (!BOT_TOKEN || !CHAT_ID) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
   for (let t = 1; t <= 3; t++) {
     try {
       const r = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-        { chat_id: chatId, text: texto, parse_mode: 'HTML', disable_web_page_preview: true },
+        { chat_id: CHAT_ID, text: texto, parse_mode: 'HTML', disable_web_page_preview: true },
         { timeout: 11000 });
       if (r.data?.ok) { R.erroTelegram = null; return { ok: true, messageId: r.data.result.message_id }; }
       R.erroTelegram = JSON.stringify(r.data);
@@ -338,28 +335,32 @@ async function tgAlert(tag, detalhe) {
     if (now - R.ultimoAlertaDB < CFG.alertThrottleMs) return;
     R.ultimoAlertaDB = now;
   }
-  await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n${detalhe}\n⏱ ${hora()}`, ALERT_CHAT_ID);
+  await tgSendRaw(`⚠️ <b>ALERTA ${tag}</b>\n${detalhe}\n⏱ ${hora()}`);
 }
 
-/* ============================ PLACAR ============================ */
+/* ============================ RESET DIÁRIO (00h00 ANGOLA) ============================ */
 
 function dailyWins() { return DAILY.green + DAILY.g1 + DAILY.g2 + DAILY.empate + DAILY.eg1 + DAILY.eg2; }
-function dailyTaxa() { return DAILY.total > 0 ? (dailyWins() / DAILY.total) * 100 : 0; }
-function dailySemGale() { return DAILY.total > 0 ? ((DAILY.green + DAILY.empate) / DAILY.total) * 100 : 0; }
-function dailyLossPct() { return DAILY.total > 0 ? (DAILY.loss / DAILY.total) * 100 : 0; }
+// taxa sobre sinais APURADOS (expirados por falha de dados ficam de fora)
+function dailyDecidiveis() { return DAILY.total - DAILY.expirado; }
+function dailyTaxa() { const d = dailyDecidiveis(); return d > 0 ? (dailyWins() / d) * 100 : 0; }
 
 async function sendDailySummary(ontem) {
   const wins = dailyWins();
+  const taxa = dailyTaxa();
+  const reais = DAILY.green + DAILY.g1 + DAILY.g2;
+  const decididos = reais + DAILY.loss;
+  const taxaReal = decididos > 0 ? (reais / decididos) * 100 : 0;
   await tgSendRaw([
-    `🕛 <b>FIM DO DIA ${ontem}</b> 🕛`,
-    '',
-    `📊 Sinais: <b>${DAILY.total}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
+    `🕛 <b>FIM DO DIA ${ontem}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
+    `📊 Sinais: <b>${DAILY.total}</b> (sem apuração: ${DAILY.expirado})`,
     `✅ Greens: ${wins} (G1: ${DAILY.g1} • G2: ${DAILY.g2})`,
     `🟡 Empates: ${DAILY.empate + DAILY.eg1 + DAILY.eg2}`,
     `❌ Loss: ${DAILY.loss}`,
     `🔥 Maior sequência: ${DAILY.bestStreak}`,
-    `🎯 Taxa (até G2): ${dailyTaxa().toFixed(1)}%`,
-    `⚠️ Sem gale: ${dailySemGale().toFixed(0)}% • Loss: ${dailyLossPct().toFixed(1)}%`,
+    `🎯 Taxa: ${taxa.toFixed(1)}% (real: ${taxaReal.toFixed(1)}%)`,
     '',
     '🌅 <b>PLACAR ZERADO — BOM DIA!</b>'
   ].join('\n'));
@@ -370,76 +371,65 @@ async function checkDailyReset() {
   if (DAILY.date && DAILY.date !== hoje) {
     const ontem = DAILY.date;
     await sendDailySummary(ontem);
-    for (const k of ['total', 'green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'loss', 'bestStreak']) DAILY[k] = 0;
+    for (const k of ['total', 'green', 'g1', 'g2', 'empate', 'eg1', 'eg2', 'loss', 'expirado', 'bestStreak']) DAILY[k] = 0;
     DAILY.date = hoje;
-    S.lossRun = 0;
-    await dbStateSet('daily_v19', JSON.stringify(DAILY));
+    await dbStateSet('daily_v20', JSON.stringify(DAILY));
     log('DIÁRIO', `reset de ${ontem} -> ${hoje}`);
   } else if (!DAILY.date) {
     DAILY.date = hoje;
   }
 }
 
-/* ============================ ESTATÍSTICA ============================ */
-
-function histReal(key) {
-  let n = 0, g01 = 0, w = 0;
-  for (const x of S.signals) {
-    if (x.key !== key || !FECHADOS.has(x.status)) continue;
-    n++;
-    if (x.status !== 'LOSS') w++;
-    if (ATE_G1.has(x.status)) g01++;
-  }
-  return { n, g01, w };
-}
-
-/* ============================ TEMPLATES ============================ */
+/* ============================ TEMPLATES SMS ============================ */
 
 function fmtAnalisando() {
-  return [`⚙️ <b>CAPUNGA v21 — Lendo a mesa…</b>`, `⏱ ${hora()}`].join('\n');
+  return [
+    '🔍 <b>CAPUNGA v20</b> — lendo a mesa…',
+    `⏱ ${hora()}`
+  ].join('\n');
 }
 
 function fmtSinal(s) {
-  const tierTag = s.tier >= 2 ? '\n🔎 <i>Mesa lenta — critério amplo, gestão redobrada</i>'
-    : s.tier === 1 ? '\n🔎 <i>Critério moderado — gestão de banca atenta</i>' : '';
-  const h = histReal(s.key);
-  const histTxt = h.n >= 10
-    ? `📊 Histórico real: ${Math.round((h.g01 / h.n) * 100)}% até G1 · ${Math.round((h.w / h.n) * 100)}% até G2 (n=${h.n})`
-    : `📊 Histórico estimado: ${s.p1 != null ? Math.round(s.p1 * 100) : '--'}% até G1 · ${s.p2 != null ? Math.round(s.p2 * 100) : '--'}% até G2`;
+  const tierTag = s.tier >= 2
+    ? '\n⚡ <i>Melhor oportunidade disponível — sem padrão forte há 5min</i>'
+    : '';
+  const confEmoji = s.conf >= 90 ? '💎' : s.conf >= 80 ? '🔥' : '⚡';
   return [
-    `🎲 ═══ <b>CAPUNGA PRIME</b> ═══ 🎲`,
+    '━━━━━━━━━━━━━━━━━━',
+    `🎲 <b>CAPUNGA PRIME — SINAL #${s.id}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
     '',
-    `🚨 <b>ENTRADA CONFIRMADA #${s.id}</b>${tierTag}`,
+    `🎯 ENTRADA: <b>${nomeCor(s.cor)}</b>`,
+    '🛡 Proteção: empate devolve',
     '',
-    `🎯 Entrar: <b>${nomeCor(s.cor)}</b>`,
-    `🛡 Proteção: EMPATE 🟡`,
-    histTxt,
-    `🧠 ${s.emoji || '🧩'} ${s.nome}`,
+    `📊 Força: ${confEmoji} <b>${s.conf}%</b> ${barra(s.conf)}`,
+    `🧠 Padrão: ${s.emoji || '🧩'} ${s.nome}${tierTag}`,
     `⏰ ${hora(s.t)}`,
     '',
-    `💎 <i>Capunga Prime — gestão de banca sempre</i>`
+    '💎 <i>Gestão de banca sempre</i>'
   ].join('\n');
 }
 
 function fmtGale(s, nivel) {
   const icons = nivel === 1 ? '🔄' : '⚠️';
-  const extra = nivel === 2 ? '\n💰 <i>Dobrar a entrada na mesma cor</i>' : '';
+  const extra = nivel === 2 ? '\n💰 <i>Dobrar na mesma cor</i>' : '';
   return [
     `${icons} <b>GALE ${nivel} — SINAL #${s.id}</b> ${icons}`,
-    `Mantenha: <b>${nomeCor(s.cor)}</b>${extra}`
+    `🎯 Mantenha: <b>${nomeCor(s.cor)}</b>${extra}`
   ].join('\n');
 }
 
 function fmtResult(s) {
-  const placar = `📅 Dia: ${dailyWins()}G • ${DAILY.loss}L • ${dailyTaxa().toFixed(0)}%`;
+  const placar = `📅 ${dailyWins()}G • ${DAILY.loss}L • ${dailyTaxa().toFixed(0)}%`;
   const msg = {
-    GREEN: `✅ <b>GREEN #${s.id}</b> ✅\n\nA mesa pagou tropa 💚\n${placar}`,
-    G1: `✅ <b>GREEN NO GALE 1 #${s.id}</b> ✅\n\nRecuperado com segurança 💪\n${placar}`,
-    G2: `✅ <b>GREEN NO GALE 2 #${s.id}</b> ✅\n\nRecuperação total, gestão mandou 🛡\n${placar}`,
-    EMPATE: `🟡 <b>GREEN NO EMPATE #${s.id}</b> 🟡\n\nProteção segurou a entrada 🛡\n${placar}`,
-    EG1: `🟡 <b>GREEN NO EMPATE G1 #${s.id}</b> 🟡\n\nProteção no gale 🛡\n${placar}`,
-    EG2: `🟡 <b>GREEN NO EMPATE G2 #${s.id}</b> 🟡\n\nProteção máxima 🛡\n${placar}`,
-    LOSS: `❌ <b>LOSS #${s.id}</b> ❌\n\nStop atingido nesta. Próxima entrada em análise 🧠\n${placar}`
+    GREEN:    `✅ <b>GREEN #${s.id}</b> — pagamento direto 💚\n${placar}`,
+    G1:       `✅ <b>GREEN NO GALE 1 #${s.id}</b> — recuperado 💪\n${placar}`,
+    G2:       `✅ <b>GREEN NO GALE 2 #${s.id}</b> — recuperação total 🛡\n${placar}`,
+    EMPATE:   `🟡 <b>EMPATE #${s.id}</b> — entrada devolvida 🛡\n${placar}`,
+    EG1:      `🟡 <b>EMPATE NO GALE 1 #${s.id}</b> — devolvido 🛡\n${placar}`,
+    EG2:      `🟡 <b>EMPATE NO GALE 2 #${s.id}</b> — devolvido 🛡\n${placar}`,
+    LOSS:     `❌ <b>LOSS #${s.id}</b> — stop atingido 🧠\n${placar}`,
+    EXPIRADO: `⏸ <b>SINAL #${s.id} SEM APURAÇÃO</b> — dados interrompidos (não conta como loss)\n${placar}`
   };
   return msg[s.status] || msg.LOSS;
 }
@@ -448,20 +438,21 @@ function fmtHistorico() {
   const streak = S.curStreak;
   const streakTxt = streak >= 3 ? `${streak} 🔥` : `${streak}`;
   return [
-    `📊 <b>PLACAR DO DIA — ${DAILY.date}</b>`,
-    '━━━━━━━━━━━━━━━',
-    `Sinais: ${DAILY.total}`,
-    `✅ Greens: ${DAILY.green} | G1: ${DAILY.g1} | G2: ${DAILY.g2}`,
+    '━━━━━━━━━━━━━━━━━━',
+    `📊 <b>PLACAR — ${DAILY.date}</b>`,
+    '━━━━━━━━━━━━━━━━━━',
+    `Sinais: ${DAILY.total} (sem apuração: ${DAILY.expirado})`,
+    `✅ ${DAILY.green} diretos • ${DAILY.g1} no G1 • ${DAILY.g2} no G2`,
     `🟡 Empates: ${DAILY.empate + DAILY.eg1 + DAILY.eg2}`,
     `❌ Loss: ${DAILY.loss}`,
-    `🔥 Sequência atual: ${streakTxt} | Recorde: ${DAILY.bestStreak}`,
-    `🎯 Taxa do dia (até G2): ${dailyTaxa().toFixed(1)}%`,
-    `⚠️ Sem gale: ${dailySemGale().toFixed(0)}% • Loss: ${dailyLossPct().toFixed(1)}%`
+    `🔥 Sequência: ${streakTxt} | Recorde: ${DAILY.bestStreak}`,
+    `🎯 Taxa (apurados): ${dailyTaxa().toFixed(1)}%`
   ].join('\n');
 }
 
 /* ============================ API ============================ */
 
+// Remove acentos SEM regex de caracteres combinantes (evita corrupção de encoding)
 function stripAccents(str) {
   return String(str ?? '').normalize('NFD').split('').filter((c) => {
     const code = c.charCodeAt(0);
@@ -485,6 +476,7 @@ function extractItems(b) {
     b.data?.results, b.data?.items, b.data?.resultados, b.data?.rounds,
     b.data?.events, b.data?.data].find(Array.isArray) || [];
 }
+// null-safe: Number(null) === 0 criaria scores falsos (ex.: Gatilho 0 falso)
 const numOrNull = (v) => {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
@@ -502,15 +494,15 @@ function normalizeRound(item) {
   const resultado = normalizeOutcome(raw);
   const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
   if (!id || !resultado || !t) return null;
-  const pj = numOrNull(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
-  const pb = numOrNull(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
+  const pj = numOrNull(r.playerDice?.score ?? d.playerDice?.score ?? r.playerScore ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
+  const pb = numOrNull(r.bankerDice?.score ?? d.bankerDice?.score ?? r.bankerScore ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
   return { id, resultado, t, pj, pb };
 }
 
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': `CapungaDados/${VERSAO}` }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/20.1' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -520,6 +512,7 @@ async function fetchFrom(url) {
   return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
 }
 
+// Fallback automático entre fontes: se a primária falhar, tenta a secundária
 async function fetchRounds() {
   const erros = [];
   for (let idx = 0; idx < API_SOURCES.length; idx++) {
@@ -574,17 +567,18 @@ function detectRegime(seq) {
   const label = chop >= 0.65 ? 'errático' : chop <= 0.35 ? 'tendência' : 'neutro';
   return { trend, chop, label };
 }
+// Estratégias de quebra só em mesa errática; de sequência só em tendência
 function regimeFit(cand, regime) {
   const k = cand.key;
-  if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.40;
-  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.40;
+  if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.45;
+  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
   return true;
 }
 
-/* ============================ ESTRATÉGIAS ============================ */
+/* ============================ ESTRATÉGIAS (30 — só as com lógica real) ============================ */
 
 const STRATS = [
-  // ---- SEQUÊNCIA ----
+  // ---- SEQUÊNCIA (padrões reais de repetição/alternância) ----
   function seqRepeticao({ seq }) {
     const n = streak(seq);
     if (n < 3 || n > 7) return null;
@@ -601,7 +595,7 @@ const STRATS = [
     const L = alternation(seq);
     if (L < 4) return null;
     const strength = L >= 6 ? 84 : L >= 5 ? 78 : 72;
-    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${Math.min(L, 8)}`, nome: `Surf ${L}`, emoji: '🌊', strength, tipo: 'seq' };
+    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, emoji: '🌊', strength, tipo: 'seq' };
   },
   function seqDoisDois({ seq }) {
     if (seq.length < 4) return null;
@@ -657,14 +651,14 @@ const STRATS = [
   },
   function bankerBias20({ seq }) {
     const s = seq.slice(0, 20);
-    if (s.length < 14) return null;
+    if (s.length < 15) return null;
     const b = s.filter((r) => r.resultado === B).length;
     const j = s.filter((r) => r.resultado === J).length;
     if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' };
     if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
     return null;
   },
-  // ---- NUMÉRICA ----
+  // ---- NUMÉRICA (força real dos dados: margens, escores, sequências de pontos) ----
   function numEscada({ seq }) {
     if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
     const [a, b, c] = seq;
@@ -726,7 +720,7 @@ const STRATS = [
   },
   function numTendencia({ rows }) {
     const s = rows.slice(0, 8).filter(hasScore);
-    if (s.length < 5) return null;
+    if (s.length < 6) return null;
     const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
     const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
     const diff = mj - mb;
@@ -775,7 +769,7 @@ const STRATS = [
     }
     return null;
   },
-  // ---- EMPATE ----
+  // ---- EMPATE (padrões pós-empate reais) ----
   function numPosEmpate({ rows, seq }) {
     if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
     return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
@@ -798,23 +792,6 @@ const STRATS = [
     if (rows[0].resultado !== E || rows[1].resultado !== E) return null;
     if (!isCol(rows[2].resultado)) return null;
     return { cor: rows[2].resultado, key: 'TIE_DOUBLE_BACK', nome: 'Retorno pós-duplo empate', emoji: '🔙', strength: 78, tipo: 'num' };
-  },
-  // ---- COBERTURA: dispara em quase toda rodada, ranqueada pelo histórico como as demais ----
-  function seguirUltima({ seq }) {
-    if (seq.length < 2) return null;
-    return { cor: seq[0].resultado, key: 'COB_SEGUIR', nome: 'Seguir última cor', emoji: '➡️', strength: 70, tipo: 'seq' };
-  },
-  function inverterUltima({ seq }) {
-    if (seq.length < 2) return null;
-    return { cor: opp(seq[0].resultado), key: 'COB_INVERTER', nome: 'Inverter última cor', emoji: '↩️', strength: 70, tipo: 'seq' };
-  },
-  function fluxoRecente({ seq }) {
-    const s = seq.slice(0, 8);
-    if (s.length < 6) return null;
-    const j = s.filter((r) => r.resultado === J).length;
-    const b = s.length - j;
-    if (j === b) return null;
-    return { cor: j > b ? J : B, key: 'COB_FLUXO_8', nome: 'Fluxo da mesa (8)', emoji: '🌐', strength: 70, tipo: 'seq' };
   }
 ];
 
@@ -828,115 +805,123 @@ function runStrategies(rows) {
   return out;
 }
 
-/* ============================ JANELA + BACKTEST ============================ */
+/* ============================ BACKTEST ============================ */
 
 function windowAt(H, i) {
   const rows = [];
   for (let j = i; j >= 0 && rows.length < 20; j--) {
-    if (rows.length && rows[rows.length - 1].t - H[j].t > CFG.windowGapMs) break;
+    if (rows.length && rows[rows.length - 1].t - H[j].t > CFG.gapMs) break;
     rows.push(H[j]);
   }
   return rows;
 }
-
-function evalDetail(H, i, cor) {
+// v20: gap nos dados -> null (desconhecido), NÃO loss.
+// Empate conta como "não perder" (devolução), coerente com a apuração real.
+function evalEntry(H, i, cor) {
   for (let k = 1; k <= CFG.maxGale + 1; k++) {
     const idx = i + k;
     if (idx >= H.length) return null;
-    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return CFG.maxGale + 1;
-    if (H[idx].resultado === cor || H[idx].resultado === E) return k - 1;
+    if (H[idx].t - H[idx - 1].t > CFG.gapMs) return null; // dados interrompidos: sem julgamento
+    if (H[idx].resultado === cor || H[idx].resultado === E) return true;
   }
-  return CFG.maxGale + 1;
+  return false;
 }
-
 function backtest() {
   const H = S.hist;
   const per = {};
   const ini = 10, fim = H.length - 1;
-  if (fim - ini < 30) return { per, base: { r1: 0.80, r2: 0.90 } };
-  let bn = 0, b1 = 0, b2 = 0;
+  if (fim - ini < 30) return { per, baseRate: 0.85 };
+  let bw = 0, bn = 0;
   for (let i = ini; i < fim; i++) {
     const win = windowAt(H, i);
-    if (win.length < CFG.warmupRounds) continue;
+    if (win.length < 6) continue;
     for (const c of runStrategies(win)) {
-      const lv = evalDetail(H, i, c.cor);
-      if (lv === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w0: 0, w1: 0, w2: 0 });
-      p.n++;
-      if (lv <= 0) p.w0++;
-      if (lv <= 1) p.w1++;
-      if (lv <= 2) p.w2++;
-      bn++; if (lv <= 1) b1++; if (lv <= 2) b2++;
+      const v = evalEntry(H, i, c.cor);
+      if (v === null) continue;
+      const p = per[c.key] || (per[c.key] = { n: 0, w: 0 });
+      p.n++; if (v) p.w++;
+      bn++; if (v) bw++;
     }
   }
-  return {
-    per,
-    base: {
-      r1: bn ? clamp(b1 / bn, 0.65, 0.92) : 0.80,
-      r2: bn ? clamp(b2 / bn, 0.80, 0.97) : 0.90
-    }
-  };
+  // v20: prior neutro 0.85 (≈ 1 - 0.5^3 de acertar numa cor em 3 rodadas),
+  // sem clamp mágico de 0.90. Limites apenas de sanidade.
+  const baseRate = bn ? bw / bn : 0.85;
+  return { per, baseRate: Math.min(CFG.baseRateMax, Math.max(CFG.baseRateMin, baseRate)) };
 }
 function getStats(force = false) {
-  if (force || !S.stats || S.novosDesdeStats >= 30) {
+  if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
     S.stats = backtest();
-    S.novosDesdeStats = 0;
+    S.statsAtLen = S.hist.length;
   }
   return S.stats;
 }
 
-function estimar(key, stats) {
-  const p = stats.per[key] || { n: 0, w0: 0, w1: 0, w2: 0 };
-  let n = p.n, w1 = p.w1, w2 = p.w2;
-  for (const x of S.signals) {
-    if (x.key !== key || !FECHADOS.has(x.status)) continue;
-    n++;
-    if (ATE_G1.has(x.status)) w1++;
-    if (x.status !== 'LOSS') w2++;
+/* ============================ CONFIANÇA (v20: honesta) ============================
+ * conf = taxa histórica de NÃO PERDER até G2 (green, gale ou empate/devolução).
+ * Prior do backtest + amostra real, SEM piso fabricado de 80.
+ * Um número alto aqui não é garantia: é o histórico observado dessa estratégia. */
+
+function bayesianRate(w, n, priorRate, priorWeight) {
+  return (w + priorRate * priorWeight) / (n + priorWeight);
+}
+function confianca(cand, ctx) {
+  const stats = ctx.stats;
+  const p = stats.per[cand.key] || { n: 0, w: 0 };
+  const baseRate = stats.baseRate || 0.85;
+  const btRate = bayesianRate(p.w, p.n, baseRate, 6);
+  // amostra real: EXPIRADO não julga a estratégia, fica de fora
+  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO');
+  const liveW = live.filter((x) => x.status !== 'LOSS').length;
+  const liveRate = live.length >= 5 ? bayesianRate(liveW, live.length, btRate, 5) : null;
+
+  let conf = Math.round((liveRate ?? btRate) * 100);
+
+  const agree = ctx.agreement?.confirmations || 0;
+  conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
+  conf += Math.round((cand.strength - 80) * 0.15);
+  if (cand.tipo === 'seq' && ctx.regime) {
+    const regimeMatch = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG'))
+      ? ctx.regime.chop : ctx.regime.trend;
+    conf += Math.round((regimeMatch - 0.5) * 4);
   }
-  const K = CFG.priorK;
-  return {
-    n,
-    p1: (w1 + stats.base.r1 * K) / (n + K),
-    p2: (w2 + stats.base.r2 * K) / (n + K)
-  };
+  if (live.length >= 5 && liveW / live.length < 0.80) conf -= 4;
+  const recentLoss = S.signals.find((x) =>
+    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
+  if (recentLoss) conf -= 3;
+
+  return Math.max(CFG.confMin, Math.min(CFG.confMax, conf));
 }
 
-/* ============================ SUSPENSÃO ============================ */
+/* ============================ SUSPENSÃO (persistente) ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
   if (!u) return false;
-  if (Date.now() > u) { delete SUSPENDED[key]; dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED))); return false; }
+  if (Date.now() > u) { delete SUSPENDED[key]; dbStateSet('suspended_v20', JSON.stringify(Object.entries(SUSPENDED))); return false; }
   return true;
 }
 function maybeSuspend(key) {
-  const fechados = S.signals.filter((x) => x.key === key && FECHADOS.has(x.status));
-  let m = null;
-  const recent = fechados.slice(-CFG.suspendLossStreak);
-  if (recent.length >= CFG.suspendLossStreak && recent.every((x) => x.status === 'LOSS')) {
-    m = `${recent.length} LOSS seguidos`;
-  }
-  if (!m) {
-    const win = fechados.slice(-CFG.suspendWindow);
-    const losses = win.filter((x) => x.status === 'LOSS').length;
-    if (win.length >= CFG.suspendWindow && losses >= CFG.suspendWindowLosses) m = `${losses} LOSS nos últimos ${win.length}`;
-  }
-  if (m) {
+  const recent = S.signals.filter((x) => x.key === key && x.status === 'LOSS').slice(-CFG.suspendLossStreak);
+  if (recent.length < CFG.suspendLossStreak) return;
+  if (recent.every((x) => x.status === 'LOSS')) {
     SUSPENDED[key] = Date.now() + CFG.suspendMs;
-    dbStateSet('suspended', JSON.stringify(Object.entries(SUSPENDED)));
-    log('SUSPENSO', { key, motivo: m });
+    dbStateSet('suspended_v20', JSON.stringify(Object.entries(SUSPENDED)));
+    log('SUSPENSO', { key, consecutiveLosses: recent.length });
   }
 }
 
-/* ============================ TIER ============================ */
+/* ============================ ESCADA DE OPORTUNIDADES ============================ */
+/* Tier 0 (mesa quente, <3min sem sinal): RIGOROSO — só entrada de alta convicção
+   Tier 1 (3-5min): RELAXADO — filtros cedem um pouco
+   Tier 2 (>5min): melhor oportunidade disponível
+   v20: TODOS os tiers exigem dados frescos (maxStaleMs) e retoma confirmada. */
 
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
 function tierAtual() {
-  const idle = idleMs();
-  let t = 0;
-  for (let i = 0; i < CFG.tiers.length; i++) if (idle >= CFG.tiers[i].after) t = i;
-  return t;
+  const i = idleMs();
+  if (i >= CFG.forceSignalMs) return 2;
+  if (i >= CFG.relaxMs) return 1;
+  return 0;
 }
 
 /* ============================ GATE ============================ */
@@ -944,95 +929,49 @@ function tierAtual() {
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
-  if (!CFG.ativos) { motivo('desativado'); return false; }
+  if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
+  if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
   const now = Date.now();
-  const last = S.hist[S.hist.length - 1];
-  if (!last) { motivo('sem hist'); return false; }
-
-  if (now - last.t > CFG.freshMaxMs) {
-    motivo(`API parada ${Math.round((now - last.t) / 1000)}s`);
-    S.apiWasDown = true;
+  if (S.lastSignalAt && now - S.lastSignalAt < CFG.minGapMs) {
+    R.ultimoMotivo = `gap ${Math.ceil((CFG.minGapMs - (now - S.lastSignalAt)) / 1000)}s`;
     return false;
   }
-  if (S.apiWasDown) {
-    S.apiWasDown = false;
-    S.skipNext = CFG.postGapSkip;
-    log('API', `voltou — aquecendo ${CFG.warmupRounds} rodadas`);
+  const last = S.hist[S.hist.length - 1];
+  if (!last) { R.ultimoMotivo = 'sem hist'; return false; }
+  // v20 — GATE DE FRESQUIDÃO: dados parados => sem sinais novos, sem exceção
+  if (now - last.t > CFG.maxStaleMs) {
+    R.dadosStale = true;
+    R.ultimoMotivo = `dados antigos ${Math.ceil((now - last.t) / 60000)}min (API parada)`;
+    return false;
   }
-
-  if (S.pauseUntil && now < S.pauseUntil) { motivo('pausa de proteção'); return false; }
-  if (DAILY.loss >= CFG.maxLossDia) { motivo('stop de loss do dia'); return false; }
-  if (pendentes().length >= CFG.maxPending) { motivo('max pending'); return false; }
-  if (S.lastSignalAt && now - S.lastSignalAt < CFG.minGapMs) { motivo('gap mínimo'); return false; }
-  if (now - last.t < CFG.minSettledAgeMs) { motivo('rodada recente'); return false; }
-  if (now < S.tgFailUntil) { motivo('cooldown telegram'); return false; }
-  if (S.hist.length < CFG.minAmostra) { motivo(`amostra ${S.hist.length}`); return false; }
+  R.dadosStale = false;
+  // v20 — RETOMA: após dados parados, exigir rodadas novas confirmadas
+  if (S.awaitingRecovery > 0) {
+    R.ultimoMotivo = `retoma: aguarda ${S.awaitingRecovery} rodada(s) nova(s)`;
+    return false;
+  }
+  if (now - last.t < CFG.minSettledAgeMs) {
+    R.ultimoMotivo = `rodada recente ${Math.ceil((CFG.minSettledAgeMs - (now - last.t)) / 1000)}s`;
+    return false;
+  }
+  if (S.hist.length < CFG.minAmostra) { R.ultimoMotivo = `amostra ${S.hist.length}`; return false; }
   return true;
 }
 
+function stratSamples(key, stats) {
+  const p = stats.per[key];
+  const bn = p ? p.n : 0;
+  let liveN = 0;
+  for (const x of S.signals) if (x.key === key && x.status !== 'PENDENTE' && x.status !== 'EXPIRADO') liveN++;
+  return bn + liveN;
+}
 function liveHitRate(key) {
   let n = 0, w = 0;
   for (const x of S.signals) {
-    if (x.key !== key || !FECHADOS.has(x.status)) continue;
+    if (x.key !== key || x.status === 'PENDENTE' || x.status === 'EXPIRADO') continue;
     n++; if (x.status !== 'LOSS') w++;
   }
   return n >= 5 ? w / n : null;
-}
-
-/* ============================ SELEÇÃO DE CANDIDATO ============================ */
-
-function escolher(rows, stats, tier) {
-  const T = CFG.tiers[tier];
-  const seq = rows.filter((r) => isCol(r.resultado));
-  const regime = detectRegime(seq);
-  const p1Min = stats.base.r1 + T.dP1;
-
-  let cands = runStrategies(rows).map((c) => ({ ...c, est: estimar(c.key, stats) }));
-  const total = cands.length;
-
-  cands = cands.filter((c) => {
-    if (T.regime && !regimeFit(c, regime)) return false;
-    if (T.useBlock && CFG.blockKeys.includes(c.key)) return false;
-    if (T.useSusp && isSuspended(c.key)) return false;
-    if (c.est.n < T.minN) return false;
-    if (c.est.p1 < p1Min) return false;
-    const lr = liveHitRate(c.key);
-    if (lr !== null && lr < T.liveMin) return false;
-    return true;
-  });
-  R.ultimoCandidatos = cands.length;
-
-  if (!cands.length && tier >= CFG.tiers.length - 1) {
-    // GARANTIA: nenhuma passou — usa a melhor disparada (preferindo não bloqueada/suspensa)
-    const todas = runStrategies(rows).map((c) => ({ ...c, est: estimar(c.key, stats) }));
-    const pref = todas.filter((c) => !CFG.blockKeys.includes(c.key) && !isSuspended(c.key));
-    const pool = pref.length ? pref : todas;
-    if (pool.length) cands = pool;
-    else if (seq.length) {
-      // Último recurso: cor mais frequente das últimas 10 (desempate: última cor)
-      const s10 = seq.slice(0, 10);
-      const j = s10.filter((r) => r.resultado === J).length;
-      const b = s10.length - j;
-      const cor = j === b ? seq[0].resultado : (j > b ? J : B);
-      cands = [{
-        cor, key: 'GARANTIA_FLUXO', nome: 'Fluxo da mesa', emoji: '🌐', strength: 65, tipo: 'seq',
-        est: estimar('GARANTIA_FLUXO', stats)
-      }];
-    }
-  }
-  if (!cands.length) return { melhor: null, total, p1Min };
-
-  const porCor = {};
-  for (const c of cands) (porCor[c.cor] || (porCor[c.cor] = [])).push(c);
-  let melhor = null;
-  for (const cor of Object.keys(porCor)) {
-    const list = porCor[cor].slice().sort((a, b) => b.est.p1 - a.est.p1 || b.strength - a.strength);
-    const top = list[0];
-    // concordância entre estratégias da mesma cor ajuda no desempate
-    const score = top.est.p1 + Math.min(list.length - 1, 3) * 0.004;
-    if (!melhor || score > melhor.score) melhor = { ...top, agree: list.length, score };
-  }
-  return { melhor, total, p1Min };
 }
 
 /* ============================ GERAR SINAL ============================ */
@@ -1040,66 +979,80 @@ function escolher(rows, stats, tier) {
 async function tentarSinal() {
   if (!podeGerar()) return;
 
-  const lastRound = S.hist[S.hist.length - 1];
-  if (S.skipRoundId === lastRound.id) { motivo('pulando rodada pós-retorno'); return; }
-
-  const rows = windowAt(S.hist, S.hist.length - 1);
-  if (rows.length < CFG.warmupRounds) { motivo(`aquecendo ${rows.length}/${CFG.warmupRounds}`); return; }
-
   const tier = tierAtual();
   R.tier = tier;
+  const T = CFG.tiers[tier];
+
+  const rows = S.hist.slice(-30).reverse();
   const stats = getStats();
+  const seq = rows.filter((r) => isCol(r.resultado));
+  const regime = detectRegime(seq);
 
-  const { melhor, total, p1Min } = escolher(rows, stats, tier);
-  if (!melhor) {
-    motivo(`tier${tier}: sem candidato (${total} disparadas, p1>=${(p1Min * 100).toFixed(0)}%)`);
-    return;
+  let cands = runStrategies(rows);
+  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
+
+  if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime)); // tier 2 ignora regime (mas pega o melhor)
+
+  cands = cands.filter((c) => {
+    if (isSuspended(c.key)) return false;
+    if (stratSamples(c.key, stats) < T.minStratN) return false;
+    const lr = liveHitRate(c.key);
+    if (lr !== null && lr < T.liveMin) return false;
+    return true;
+  });
+  if (!cands.length) { R.ultimoMotivo = `tier${tier}: filtros (${T.scoreMin}%/${T.minStratN}am)`; return; }
+
+  const byColor = {};
+  for (const c of cands) {
+    if (!byColor[c.cor]) byColor[c.cor] = [];
+    byColor[c.cor].push(c);
   }
 
-  if (S.skipNext > 0) {
-    S.skipNext--;
-    S.skipRoundId = lastRound.id;
-    motivo('pulando 1º sinal pós-retorno da API');
-    log('SKIP', { key: melhor.key, rodada: lastRound.id });
-    return;
+  let melhor = null;
+  for (const cor of Object.keys(byColor)) {
+    const list = byColor[cor];
+    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
+    scored.sort((a, b) => b.conf - a.conf);
+    const top = scored[0];
+    if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
   }
+
+  if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
+  // v20: scoreMin aplica-se a TODOS os tiers (tier 2 tem limiar menor, mas existe)
+  if (melhor.conf < T.scoreMin) { R.ultimoMotivo = `score ${melhor.conf} < ${T.scoreMin} (tier${tier})`; return; }
 
   const reservedId = S.nextId;
-  const sinal = {
+  const sinalPreliminar = {
     id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
-    conf: Math.round(melhor.est.p1 * 100), p1: melhor.est.p1, p2: melhor.est.p2,
-    tipo: melhor.tipo, status: 'PENDENTE', tier,
-    t: Date.now(), criadoEm: 0, agree: melhor.agree,
+    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE', tier,
+    t: 0, criadoEm: 0, agree: melhor.agree,
     gale1MsgId: null, gale2MsgId: null, galeLevel: 0
   };
 
   const analisando = await tgSendRaw(fmtAnalisando());
   try {
-    const envio = await tgSendRaw(fmtSinal(sinal));
+    const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
     if (!envio.ok) {
-      S.tgFailUntil = Date.now() + CFG.tgFailCooldownMs;
-      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId, erro: R.erroTelegram });
-      motivo('telegram falhou');
+      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
+      R.ultimoMotivo = 'telegram falhou';
       return;
     }
     const agora = Date.now();
-    sinal.t = agora;
-    sinal.criadoEm = agora;
+    sinalPreliminar.t = agora;
+    sinalPreliminar.criadoEm = agora;
     S.nextId++;
-    S.signals.push(sinal);
+    S.signals.push(sinalPreliminar);
     if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
     S.lastSignalAt = agora;
-    R.ultimoSinal = sinal;
+    R.ultimoSinal = sinalPreliminar;
     R.ultimoMotivo = null;
 
-    await dbSignalInsert(sinal);
-    await dbStateSet('nextId', String(S.nextId));
-    await dbStateSet('lastSignalAt', String(agora));
+    await dbSignalInsert(sinalPreliminar);
+    await dbStateSet('nextId_v20', String(S.nextId));
+    await dbStateSet('lastSignalAt_v20', String(agora));
 
-    log('SINAL', {
-      id: sinal.id, cor: sinal.cor, key: sinal.key,
-      p1: +(melhor.est.p1 * 100).toFixed(1), p2: +(melhor.est.p2 * 100).toFixed(1), n: melhor.est.n, tier
-    });
+    log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key, tier });
+
   } finally {
     if (analisando.ok) await tgDelete(analisando.messageId);
   }
@@ -1129,38 +1082,31 @@ async function fecharSinal(s, status, gale) {
   if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
 
   const bucket = status === 'GREEN' ? 'green' : status === 'G1' ? 'g1' : status === 'G2' ? 'g2'
-    : status === 'EMPATE' ? 'empate' : status === 'EG1' ? 'eg1' : status === 'EG2' ? 'eg2' : 'loss';
+    : status === 'EMPATE' ? 'empate' : status === 'EG1' ? 'eg1' : status === 'EG2' ? 'eg2'
+    : status === 'EXPIRADO' ? 'expirado' : 'loss';
   ALLTIME[bucket]++; ALLTIME.total++;
   DAILY[bucket]++; DAILY.total++;
-
-  let msgProtecao = null;
+  // EXPIRADO não julga a estratégia: não mexe na sequência nem suspende
   if (status === 'LOSS') {
     S.curStreak = 0;
-    S.lossRun++;
-    if (DAILY.loss >= CFG.maxLossDia) {
-      msgProtecao = `🛑 <b>STOP DO DIA</b>\n${DAILY.loss} LOSS hoje. Sinais encerrados até 00h00. Respeite o stop da sua banca.`;
-    } else if (S.lossRun >= CFG.lossPauseAfter) {
-      S.pauseUntil = Date.now() + CFG.lossPauseMs;
-      S.lossRun = 0;
-      msgProtecao = `🛑 <b>PAUSA DE PROTEÇÃO</b>\n${CFG.lossPauseAfter} LOSS seguidos. Sinais pausados por ${Math.round(CFG.lossPauseMs / 60000)} min.`;
-      await dbStateSet('pauseUntil', String(S.pauseUntil));
-    }
-  } else {
+  } else if (status !== 'EXPIRADO') {
     S.curStreak++;
-    S.lossRun = 0;
     if (S.curStreak > DAILY.bestStreak) DAILY.bestStreak = S.curStreak;
   }
-  await dbStateSet('curStreak', String(S.curStreak));
-  await dbStateSet('daily_v19', JSON.stringify(DAILY));
+  await dbStateSet('curStreak_v20', String(S.curStreak));
+  await dbStateSet('daily_v20', JSON.stringify(DAILY));
 
   await dbSignalUpdate(s);
   await tgSendRaw(fmtResult(s));
   await tgSendRaw(fmtHistorico());
-  if (msgProtecao) await tgSendRaw(msgProtecao);
-  maybeSuspend(s.key);
+  if (status === 'LOSS') maybeSuspend(s.key);
 }
 
 /* ============================ APURAÇÃO ============================ */
+/* REGRA v20:
+   - Rodadas presentes e contra a cor (3x seguidas, sem falha de dados) => LOSS real.
+   - Falha de dados (gap > gapMs, ou rodadas nunca chegaram) => EXPIRADO (sem apuração).
+   - Cor ou empate => GREEN/G1/G2/EMPATE/EG1/EG2. */
 
 async function apurar() {
   const now = Date.now();
@@ -1172,7 +1118,8 @@ async function apurar() {
       const r = after[k];
       const prevT = k === 0 ? s.t : after[k - 1].t;
       if (r.t - prevT > CFG.gapMs) {
-        await fecharSinal(s, 'LOSS', k);
+        // dados interrompidos: entrada não julgável
+        await fecharSinal(s, 'EXPIRADO', k);
         decided = true; break;
       }
       if (r.resultado === s.cor || r.resultado === E) {
@@ -1182,22 +1129,28 @@ async function apurar() {
       if (k < CFG.maxGale && s.galeLevel < k + 1) await notificarGale(s, k + 1);
     }
     if (decided) continue;
-    if (!after.length && now - s.t > CFG.gapMs) {
-      await fecharSinal(s, 'LOSS', 0);
+    if (!after.length) {
+      // nenhuma rodada chegou depois do sinal
+      if (now - s.t > CFG.gapMs || now - s.t >= CFG.apuraMaxMs) {
+        await fecharSinal(s, 'EXPIRADO', 0);
+      }
     } else if (after.length >= CFG.maxGale + 1) {
+      // 3 rodadas após o sinal, todas contra, sem falha de dados: LOSS real
       await fecharSinal(s, 'LOSS', CFG.maxGale);
     } else if (now - s.t >= CFG.apuraMaxMs) {
-      await fecharSinal(s, 'LOSS', s.galeLevel || 0);
+      // timeout com dados incompletos: sem apuração
+      await fecharSinal(s, 'EXPIRADO', s.galeLevel || 0);
     }
   }
 }
 
-/* ============================ SYNC ============================ */
+/* ============================ SYNC ADAPTATIVO ============================ */
 
 function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
   const last = S.hist[S.hist.length - 1];
-  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs;
+  if (last && Date.now() - last.t < 45000) return CFG.syncFastMs; // mesa quente
+  if (S.awaitingRecovery > 0) return CFG.syncFastMs; // v20: retoma em curso, monitorar de perto
   return CFG.syncMs;
 }
 
@@ -1219,16 +1172,37 @@ async function sync() {
     S.hist = [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
     if (S.hist.length > CFG.maxHist) S.hist = S.hist.slice(-CFG.maxHist);
     S.seen = new Set(S.hist.map((r) => r.id));
-    S.novosDesdeStats += novos;
     R.ultimaSync = new Date().toISOString();
     const newest = S.hist[S.hist.length - 1];
     if (newest) R.ultimaRodadaNova = new Date(newest.t).toISOString();
 
+    // v20 — máquina de estados da retoma:
+    // dados parados -> exige recoveryRounds rodadas novas -> só então volta a emitir
+    const stale = !newest || Date.now() - newest.t > CFG.maxStaleMs;
+    if (stale) {
+      R.dadosStale = true;
+      if (S.awaitingRecovery < CFG.recoveryRounds) {
+        S.awaitingRecovery = CFG.recoveryRounds;
+        log('RETOMA', `dados parados — exigindo ${CFG.recoveryRounds} rodadas novas antes de novos sinais`);
+      }
+    } else {
+      R.dadosStale = false;
+      if (S.awaitingRecovery > 0) {
+        const antes = S.awaitingRecovery;
+        S.awaitingRecovery = Math.max(0, S.awaitingRecovery - novos);
+        if (S.awaitingRecovery !== antes) {
+          log('RETOMA', `dados voltaram — faltam ${S.awaitingRecovery} rodada(s) para liberar sinais`);
+        }
+      }
+    }
+
     if (newest && Date.now() - newest.t > CFG.staleAlertMs) {
       const mins = Math.floor((Date.now() - newest.t) / 60000);
-      await tgAlert('API', `API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nFonte: ${R.fonteAPI + 1}/${API_SOURCES.length}\nSinais pausados até a API normalizar.`);
+      await tgAlert('API', `API BACBO sem rodadas novas há <b>${mins} min</b>.\nÚltima: ${R.ultimaRodadaNova}\nFonte: ${R.fonteAPI + 1}/${API_SOURCES.length}\n🛑 Sinais suspensos até os dados voltarem`);
     }
-    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI });
+
+    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI + 1, retoma: S.awaitingRecovery });
+
   } catch (e) {
     R.erroAPI = e.message;
     log('SYNC ERRO', e.message);
@@ -1247,17 +1221,9 @@ async function tick() {
       await sync();
       lastSyncAt = Date.now();
     }
-    await apurar();
+    await apurar();    // apura a cada 1s — gale nunca atrasa
     await tentarSinal();
-    // Diagnóstico periódico: se não está gerando sinais, o log diz porquê
-    if (now - R.ultimoLogMotivo >= CFG.motivoLogMs) {
-      R.ultimoLogMotivo = now;
-      log('ESTADO', {
-        motivo: R.ultimoMotivo, tier: R.tier, semSinalHa: Math.round(Math.min(idleMs(), 1e9) / 1000) + 's',
-        candidatos: R.ultimoCandidatos, hist: S.hist.length, pendentes: pendentes().length
-      });
-    }
-  } catch (e) { log('TICK ERRO', e.stack || e.message); }
+  } catch (e) { log('TICK ERRO', e.message); }
   finally { busy = false; }
 }
 
@@ -1291,23 +1257,23 @@ function requireAdmin(req, res, next) {
 
 app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
-  const apiStale = newest ? Date.now() - newest.t > CFG.staleAlertMs : true;
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: VERSAO, deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '20.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
-    semSinalSeg: S.lastSignalAt ? Math.round((Date.now() - S.lastSignalAt) / 1000) : null,
-    motivo: R.ultimoMotivo,
-    diario: { ...DAILY, taxa: dailyTaxa(), semGale: dailySemGale(), lossPct: dailyLossPct() }, geral: ALLTIME,
-    protecao: { pausaAte: S.pauseUntil > Date.now() ? new Date(S.pauseUntil).toISOString() : null, skipNext: S.skipNext },
+    dadosStale: R.dadosStale,
+    aguardaRetoma: S.awaitingRecovery,
+    rodasRetoma: CFG.recoveryRounds,
+    diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
     ultimaSync: R.ultimaSync, ultimaRodada: newest ? R.ultimaRodadaNova : null,
-    apiStale, erroAPI: R.erroAPI, erroTelegram: R.erroTelegram, erroDB: R.erroDB,
+    apiStale: newest ? Date.now() - newest.t > CFG.staleAlertMs : true,
+    erroAPI: R.erroAPI, erroDB: R.erroDB,
     uptime: Math.round(process.uptime())
   });
 });
 app.get('/status', requireAdmin, (req, res) => {
-  res.json({ motivo: R.ultimoMotivo, motivos: R.motivos, R, DAILY, ALLTIME, CFG, suspenso: Object.keys(SUSPENDED) });
+  res.json({ motivo: R.ultimoMotivo, R, DAILY, ALLTIME, CFG, suspenso: Object.keys(SUSPENDED) });
 });
 app.get('/sinais', requireAdmin, (req, res) => {
   const n = Math.min(100, Math.max(1, parseInt(req.query.n, 10) || 20));
@@ -1318,65 +1284,28 @@ app.get('/stats', requireAdmin, (req, res) => {
   const reais = DAILY.green + DAILY.g1 + DAILY.g2;
   const decididos = reais + DAILY.loss;
   const gw = ALLTIME.green + ALLTIME.g1 + ALLTIME.g2 + ALLTIME.empate + ALLTIME.eg1 + ALLTIME.eg2;
-  const g0 = ALLTIME.green + ALLTIME.empate;
-  const g01 = g0 + ALLTIME.g1 + ALLTIME.eg1;
+  const gDecidiveis = ALLTIME.total - ALLTIME.expirado;
   res.json({
     diario: {
-      ...DAILY, wins, taxa: DAILY.total > 0 ? wins / DAILY.total : null,
-      taxaReal: decididos > 0 ? reais / decididos : null,
-      semGale: DAILY.total > 0 ? (DAILY.green + DAILY.empate) / DAILY.total : null,
-      sequenciaAtual: S.curStreak
+      ...DAILY, wins, taxa: dailyTaxa(),
+      taxaReal: decididos > 0 ? reais / decididos : null, sequenciaAtual: S.curStreak
     },
     geral: {
       ...ALLTIME, wins: gw,
-      taxa: ALLTIME.total > 0 ? gw / ALLTIME.total : null,
-      semGale: ALLTIME.total > 0 ? g0 / ALLTIME.total : null,
-      ateG1: ALLTIME.total > 0 ? g01 / ALLTIME.total : null,
-      lossPct: ALLTIME.total > 0 ? ALLTIME.loss / ALLTIME.total : null
+      taxa: gDecidiveis > 0 ? gw / gDecidiveis : null
     }
   });
 });
-// Desempenho por tier: mostra o custo real da frequência garantida
-app.get('/tiers', requireAdmin, (req, res) => {
-  const out = {};
-  for (const s of S.signals) {
-    if (!FECHADOS.has(s.status)) continue;
-    const o = out[`tier${s.tier || 0}`] || (out[`tier${s.tier || 0}`] = { n: 0, ateG1: 0, ateG2: 0, loss: 0 });
-    o.n++;
-    if (ATE_G1.has(s.status)) o.ateG1++;
-    if (s.status !== 'LOSS') o.ateG2++; else o.loss++;
-  }
-  res.json(out);
-});
+// v20: calibração por faixa de confiança — expirados excluídos
 app.get('/calibracao', requireAdmin, (req, res) => {
-  const defs = [['<76', 0, 75], ['76-79', 76, 79], ['80-83', 80, 83], ['84+', 84, 100]];
-  const out = {};
-  for (const [nome] of defs) out[nome] = { n: 0, ateG1: 0, ateG2: 0, loss: 0 };
+  const buckets = { '50-69': { n: 0, w: 0 }, '70-79': { n: 0, w: 0 }, '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
   for (const s of S.signals) {
-    if (!FECHADOS.has(s.status)) continue;
-    const d = defs.find(([, a, b]) => s.conf >= a && s.conf <= b);
-    if (!d) continue;
-    const o = out[d[0]];
-    o.n++;
-    if (ATE_G1.has(s.status)) o.ateG1++;
-    if (s.status !== 'LOSS') o.ateG2++; else o.loss++;
+    if (s.status === 'PENDENTE' || s.status === 'EXPIRADO') continue;
+    const b = s.conf >= 93 ? '93-95' : s.conf >= 86 ? '86-92' : s.conf >= 80 ? '80-85' : s.conf >= 70 ? '70-79' : '50-69';
+    buckets[b].n++;
+    if (s.status !== 'LOSS') buckets[b].w++;
   }
-  res.json(out);
-});
-app.get('/estrategias', requireAdmin, (req, res) => {
-  const stats = getStats();
-  const keys = new Set(Object.keys(stats.per));
-  for (const s of S.signals) keys.add(s.key);
-  const lista = [...keys].map((key) => {
-    const e = estimar(key, stats);
-    const h = histReal(key);
-    return {
-      key, n: e.n, p1: +(e.p1 * 100).toFixed(1), p2: +(e.p2 * 100).toFixed(1),
-      sinaisFechados: h.n, loss: h.n - h.w,
-      bloqueada: CFG.blockKeys.includes(key), suspensa: isSuspended(key)
-    };
-  }).sort((a, b) => b.p1 - a.p1);
-  res.json({ base: stats.base, estrategias: lista });
+  res.json(buckets);
 });
 
 /* ============================ START ============================ */
@@ -1386,7 +1315,7 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: VERSAO, deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '20.1', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
@@ -1397,6 +1326,11 @@ async function start() {
   await sync();
   getStats(true);
 
+  // v20: se arrancar com dados parados, entra em modo retoma
+  const last = S.hist[S.hist.length - 1];
+  if (!last || Date.now() - last.t > CFG.maxStaleMs) S.awaitingRecovery = CFG.recoveryRounds;
+
+  // Recupera PENDENTES com a regra de gap
   for (const s of S.signals) {
     if (s.status !== 'PENDENTE') continue;
     const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
@@ -1410,6 +1344,7 @@ async function start() {
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
+  // tick a CADA 1 SEGUNDO — sync interno é adaptativo (1s quente / 3s normal)
   tickTimer = setInterval(() => tick().catch(() => {}), 1000);
   keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
   setTimeout(() => tick().catch(() => {}), 1500);
